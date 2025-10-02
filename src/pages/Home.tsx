@@ -1,14 +1,13 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { SearchBar } from '@/components/SearchBar';
 import { ProductGrid } from '@/components/ProductGrid';
 import { ProductFilters } from '@/components/ProductFilters';
 import { SectionTitle } from '@/components/SectionTitle';
 import { EmptyState } from '@/components/EmptyState';
 import { ProductGridSkeleton } from '@/components/Skeleton';
-import { getProducts, getCategories, type Product } from '@/lib/supabaseClient';
+import { getProducts, getCategories, searchProducts, type Product } from '@/lib/supabaseClient';
 import { useToast } from '@/hooks/use-toast';
 import { useDebounce } from '@/hooks/useDebounce';
-
 // IA / Voz
 import { useVoiceSession } from '@/lib/useVoiceSession';
 import { askGemini } from '@/lib/llm';
@@ -17,9 +16,60 @@ import { buildPrompt } from '@/lib/prompt';
 
 const PRODUCTS_PER_PAGE = 12;
 
+// =============================================================================
+// === HELPER FUNCTIONS & TYPES (Fuera del componente para evitar re-creación) ===
+// =============================================================================
+
+/** Tipo para los mensajes de la conversación de voz/texto */
 type Msg = { role: 'user' | 'assistant'; content: string };
 
+/** Normaliza el formato de los "chunks" de RAG a { text: string }[] */
+function normalizeChunks(raw: unknown): Array<{ text: string }> {
+  const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return arr.map((c) => {
+    if (!c) return { text: '' };
+    if (typeof c === 'string') return { text: c };
+    if (typeof (c as any).text === 'string') return { text: (c as any).text };
+    return { text: String(c) };
+  });
+}
+
+/** Formatea un número a precio con signo de dólar y separador de miles */
+function fmtPrice(v: any): string {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) && n > 0 ? `$${n.toLocaleString()}` : '—';
+}
+
+/** Asigna un puntaje a un producto basado en una consulta de búsqueda */
+function scoreProduct(p: Product, q: string): number {
+  const name = String(p?.name ?? '').toLowerCase();
+  const desc = String(p?.description ?? '').toLowerCase();
+  const STOP = new Set(['de', 'del', 'la', 'el', 'the', 'and', 'or', 'para', 'con', 'sin', 'por', 'en']);
+  const WEAK = new Set(['bluetooth', 'noise', 'portable', 'portatil', 'inalambrico', 'wireless', 'smart']);
+  const toks = q.toLowerCase().split(/[\s,.;:!?()]+/).filter(t => t.length >= 3 && !STOP.has(t));
+  let score = 0;
+
+  for (const t of toks) {
+    const w = WEAK.has(t) ? 1 : 4;
+    if (name.includes(t)) score += 2 * w;
+    if (desc.includes(t)) score += 1 * w;
+  }
+
+  const rating = typeof p?.rating === 'number' ? p.rating : 0;
+  return score * 10 + rating;
+}
+
+/** Elige el mejor producto de una lista basado en la consulta usando el score */
+function pickBestProduct(list: Product[], q: string): Product | null {
+  return [...list].sort((a, b) => scoreProduct(b, q) - scoreProduct(a, q))[0] ?? null;
+}
+
+// =============================================================================
+// === COMPONENTE PRINCIPAL ===
+// =============================================================================
+
 export default function Home() {
+  // --- ESTADO PRINCIPAL DE PRODUCTOS/FILTROS ---
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -35,94 +85,144 @@ export default function Home() {
   const { toast } = useToast();
   const debouncedSearch = useDebounce(searchQuery, 300);
 
-  // ---------- Tipos y helpers (defínelos una sola vez, fuera del componente) ----------
-  type Msg = { role: 'user' | 'assistant'; content: string };
-
-  /** Normaliza cualquier forma de chunks a { text: string }[] */
-  function normalizeChunks(raw: unknown): Array<{ text: string }> {
-    const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
-    return arr.map((c) => {
-      if (!c) return { text: '' };
-      if (typeof c === 'string') return { text: c };
-      if (typeof (c as any).text === 'string') return { text: (c as any).text };
-      return { text: String(c) };
-    });
-  }
-
-  // ---------- Dentro del componente (una sola vez) ----------
+  // --- ESTADO DE VOZ/IA ---
   const [showVoicePanel, setShowVoicePanel] = useState(false);
   const [messages, setMessages] = useState<Msg[]>([]);
 
+  // === LÓGICA DE ASISTENTE DE VOZ/TEXTO (RAG + GEMINI) ===
 
-  // === VOZ + RAG + GEMINI (usa el hook existente) ===
-  const voice = useVoiceSession(async (userQuery: string) => {
+  /** Función unificada para manejar la consulta a la IA (desde voz o texto) */
+  const handleVoiceOrTextQuery = useCallback(async (q: string, contextProduct: Product | undefined): Promise<string> => {
+    const userQuery = (q || '').trim();
+    if (!userQuery) return 'No se detectó una consulta válida.';
+
+    // 1. Añadir el mensaje de usuario
+    setMessages((m) => [...m, { role: 'user', content: userQuery }]);
+
     try {
-      const q = (userQuery || '').trim();
-      if (!q) return 'No te entendí. ¿Puedes repetirlo?';
+      // 2. Buscar coincidencias iniciales en Supabase
+      const found = await searchProducts(userQuery, { limit: 12 });
+      const product = found.length ? pickBestProduct(found, userQuery) : contextProduct || null;
 
-      setMessages((m) => [...m, { role: 'user', content: q }]);
+      let replyText: string;
 
-      const product = products?.[0]; // producto en foco: el primero listado
-      let prompt: string;
-
-      if (product) {
-        try {
-          const rag: any = await fetchRagContext({
-            productId: product.id,
-            userQuery: q,
-          });
-
-          // Acepta snake_case o camelCase
-          const productInfo = (rag?.product_info ?? rag?.productInfo) ?? {};
-          const rawChunks = (rag?.context_chunks ?? rag?.contextChunks ?? rag?.chunks) ?? [];
-          const chunks = normalizeChunks(rawChunks);
-
-          prompt = buildPrompt({
-            product: { ...(product || {}), ...(productInfo || {}) },
-            chunks,
-            userQuery: q,
-          });
-        } catch (ragErr) {
-          console.warn('RAG falló; usando prompt simple:', ragErr);
-          prompt = `Eres un asistente de compras y debes responder SIEMPRE en español.
-Usuario: "${q}".
-Sé breve (3–5 líneas) y útil. Si faltan datos, dilo.`;
+      if (!product) {
+        // Opción A: No hay producto claro.
+        if (found.length) {
+          // Si hay resultados, se sugiere elegir uno.
+          const bullets = found.slice(0, 3).map((p, i) =>
+            `${i + 1}. ${p.name} — ${fmtPrice(p.price)} — ⭐ ${p.rating ?? 'N/A'} (${p.category})`
+          ).join('\n');
+          replyText = `Encontré ${found.length} coincidencias:\n${bullets}\n\nDi el número o nombre para ver detalles.`;
+        } else {
+          // Si no hay resultados, se pide ayuda a Gemini con sugerencias.
+          const tip = await askGemini(
+            `No encontré productos en la base para: "${userQuery}".
+Responde en español con 2–4 líneas de sugerencias de palabras clave y filtros concretos.`
+          );
+          replyText = tip || 'No encontré coincidencias. Prueba con palabras más concretas o una categoría.';
         }
       } else {
-        prompt = `Eres un asistente de compras y debes responder SIEMPRE en español.
-Usuario: "${q}".
-No hay productos cargados. Responde con orientación general en 3–5 líneas, sin inventar precios ni stock.`;
+        // Opción B: Se ha seleccionado un producto (RAG + Prompt robusto).
+        try {
+          const rag: any = await fetchRagContext({ productId: product.id, userQuery, topK: 6 });
+
+          const rawChunks = (rag?.context_chunks ?? rag?.chunks) ?? [];
+          const chunks = normalizeChunks(rawChunks)
+            .filter((c: any) => Number(c.similarity ?? 0) >= 0.55); // Filtrar por similitud si está disponible
+
+          const prompt = buildPrompt({
+            product,
+            chunks,
+            userQuery,
+          });
+
+          replyText = await askGemini(prompt) || 'Ahora mismo no pude obtener respuesta.';
+        } catch (ragError) {
+          console.error('Error RAG/Prompt:', ragError);
+          // Fallback simple si el RAG falla
+          const fallbackPrompt = `Eres un asistente de compras y debes responder SIEMPRE en español.
+Usuario: "${userQuery}".
+Producto: ${product.name}.
+Sé breve (3–5 líneas) y útil, basándote solo en el nombre del producto.`;
+          replyText = await askGemini(fallbackPrompt) || 'Hubo un error al buscar información detallada. Intenta nuevamente.';
+        }
       }
 
-      try {
-        const reply = await askGemini(prompt);
-        const text = reply || 'Ahora mismo no pude obtener respuesta.';
-        setMessages((m) => [...m, { role: 'assistant', content: text }]);
-        return text;
-      } catch (llmErr) {
-        console.error('Error al llamar a Gemini:', llmErr);
-        const fallback = 'Ahora mismo no pude obtener respuesta.';
-        setMessages((m) => [...m, { role: 'assistant', content: fallback }]);
-        return fallback;
-      }
+      // 3. Añadir la respuesta del asistente
+      setMessages((m) => [...m, { role: 'assistant', content: replyText }]);
+
+      return replyText;
+
     } catch (err) {
-      console.error('Error en callback de voz:', err);
-      const fallback = 'Ocurrió un problema. Intenta nuevamente.';
+      console.error('Error en handleVoiceOrTextQuery:', err);
+      const fallback = 'Ocurrió un problema grave. Intenta nuevamente.';
       setMessages((m) => [...m, { role: 'assistant', content: fallback }]);
       return fallback;
     }
+  }, []); // Dependencias vacías, ya que 'setMessages' y 'toast' son estables.
+
+  // --- HOOK DE VOZ ---
+  const voice = useVoiceSession(async (userQuery: string) => {
+    // Buscar productos que coincidan con la consulta del usuario
+    const found = await searchProducts(userQuery, { limit: 12 });
+
+    if (!found.length) {
+      // No hubo match: ofrece alternativas (top 3 recientes/bien valorados)
+      const alternatives = await getProducts({ limit: 3 });
+
+      const msg = alternatives.length
+        ? `No encontré productos con esa especificación. Pero puedo sugerirte estas opciones:\n` +
+        alternatives
+          .map(p => `• ${p.name} — ${Number.isFinite(p.price) && p.price! > 0 ? `$${p.price!.toLocaleString()}` : '—'} — ⭐ ${p.rating ?? 'N/A'} (${p.category})`)
+          .join('\n') +
+        `\n\n¿Te interesa alguno o prefieres ajustar los filtros (categoría/precio/características)?`
+        : `No encontré productos con esa especificación. ¿Quieres que pruebe en otra categoría o con otras palabras clave?`;
+
+      // Devuelve el mensaje (si esto está dentro de un callback de voz, retorna el string)
+      return msg;
+    }
+
+    // Sí hubo resultados: usa el mejor como contexto (o el primero)
+    const contextProduct = found[0]; // o pickBestProduct(found, userQuery) si ya tienes esa función
+    const reply = await handleVoiceOrTextQuery(userQuery, contextProduct);
+    return reply;
+
+
+    // Reproducir en voz alta (TTS) - La lógica se mueve aquí, fuera de handleVoiceOrTextQuery,
+    // ya que el callback de useVoiceSession es el punto de entrada para la voz.
+    try {
+      if (reply) {
+        const utter = new SpeechSynthesisUtterance(reply);
+        utter.lang = 'es-ES';
+        window.speechSynthesis?.speak(utter);
+      }
+    } catch { /* Fallo silencioso */ }
+
+    return reply;
   });
 
-  // Cerrar/purgar el panel
+  // --- MANEJO DE CONSULTA DE TEXTO MANUAL ---
+
+  /** Permite enviar texto manual al flujo de IA (útil para el reintento o follow-up) */
+  const voiceFromText = useCallback(async (q: string) => {
+    const contextProduct = products?.[0];
+    // Ejecuta la lógica de consulta (que incluye añadir a 'messages')
+    await handleVoiceOrTextQuery(q, contextProduct);
+  }, [handleVoiceOrTextQuery, products]);
+
+  // --- UTILIDADES DEL PANEL DE VOZ ---
+
+  /** Cierra y limpia el panel de voz, deteniendo cualquier TTS */
   function closeVoicePanel() {
     setShowVoicePanel(false);
     setMessages([]);
     try {
       window.speechSynthesis?.cancel();
-    } catch { }
+    } catch { /* Fallo silencioso */ }
   }
 
-  // Reintentar: vuelve a preguntar con el último mensaje de usuario
+  /** Reintenta la última consulta de usuario (de texto o voz) */
   async function retryLast() {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     if (lastUser) {
@@ -130,61 +230,11 @@ No hay productos cargados. Responde con orientación general en 3–5 líneas, s
     }
   }
 
-  // Permitir enviar texto manual al flujo de IA (útil para retry)
-  async function voiceFromText(q: string) {
-    try {
-      const question = (q || '').trim();
-      if (!question) return;
+  // =============================================================================
+  // === EFECTOS: CARGA DE DATOS ===
+  // =============================================================================
 
-      setMessages((m) => [...m, { role: 'user', content: question }]);
-
-      const product = products?.[0];
-      let prompt: string;
-
-      if (product) {
-        try {
-          const rag: any = await fetchRagContext({
-            productId: product.id,
-            userQuery: question,
-          });
-
-          const productInfo = (rag?.product_info ?? rag?.productInfo) ?? {};
-          const rawChunks = (rag?.context_chunks ?? rag?.contextChunks ?? rag?.chunks) ?? [];
-          const chunks = normalizeChunks(rawChunks);
-
-          prompt = buildPrompt({
-            product: { ...(product || {}), ...(productInfo || {}) },
-            chunks,
-            userQuery: question,
-          });
-        } catch {
-          prompt = `Eres un asistente de compras y debes responder SIEMPRE en español.
-Usuario: "${question}".
-Sé breve (3–5 líneas) y útil.`;
-        }
-      } else {
-        prompt = `Eres un asistente de compras y debes responder SIEMPRE en español.
-Usuario: "${question}".
-No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
-      }
-
-      const reply = await askGemini(prompt);
-      const text = reply || 'Sin respuesta.';
-      setMessages((m) => [...m, { role: 'assistant', content: text }]);
-
-      // Además lo leemos en voz alta (ES)
-      try {
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.lang = 'es-ES';
-        window.speechSynthesis?.speak(utter);
-      } catch { }
-    } catch {
-      setMessages((m) => [...m, { role: 'assistant', content: 'No se pudo reintentar.' }]);
-    }
-  }
-
-
-  // === CATEGORÍAS AL MONTAR ===
+  // === CARGAR CATEGORÍAS AL MONTAR ===
   useEffect(() => {
     const loadCategories = async () => {
       try {
@@ -197,7 +247,7 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
     loadCategories();
   }, []);
 
-  // === LISTAR PRODUCTOS CUANDO CAMBIAN FILTROS ===
+  // === CARGAR PRODUCTOS AL CAMBIAR FILTROS (Debounced) ===
   useEffect(() => {
     const loadProductsFx = async () => {
       setIsLoading(true);
@@ -231,6 +281,7 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
   }, [debouncedSearch, category, priceMin, priceMax, toast]);
 
   // === PAGINACIÓN: LOAD MORE ===
+
   const handleLoadMore = async () => {
     setIsLoadingMore(true);
     const newOffset = offset + PRODUCTS_PER_PAGE;
@@ -260,8 +311,13 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
     }
   };
 
+  // =============================================================================
+  // === RENDERIZADO ===
+  // =============================================================================
+
   return (
     <div className="min-h-screen bg-background">
+      {/* --- HEADER Y BARRA DE BÚSQUEDA --- */}
       <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container mx-auto px-4 py-6">
           <div className="flex flex-col gap-6">
@@ -278,14 +334,14 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
                 />
               </div>
 
-              {/* Botón de voz minimalista (sustituye VoiceButton externo) */}
+              {/* Botón para iniciar la voz */}
               <button
                 onClick={() => {
                   setShowVoicePanel(true);
                   voice.startListening();
                 }}
                 className="px-4 py-2 rounded bg-emerald-600 text-white"
-                disabled={voice.status === 'listening' || voice.status === 'speaking'}
+                disabled={voice.status !== 'idle'}
                 title="Talk with AI"
               >
                 {voice.status === 'listening'
@@ -297,12 +353,14 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
                       : 'Talk'}
               </button>
 
-              {/* Botón Stop (detener TTS si está hablando) */}
+              {/* Botón Stop (detener TTS) */}
               <button
                 onClick={() => {
-                  try { speechSynthesis.cancel(); } catch { }
+                  try { speechSynthesis.cancel(); } catch { /* Fallo silencioso */ }
                 }}
                 className="px-3 py-2 rounded border"
+                title="Stop speaking"
+                disabled={voice.status !== 'speaking'}
               >
                 Stop
               </button>
@@ -311,8 +369,10 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
         </div>
       </header>
 
+      {/* --- CONTENIDO PRINCIPAL Y FILTROS --- */}
       <main className="container mx-auto px-4 py-8">
         <div className="flex flex-col lg:flex-row gap-8">
+          {/* Aside: Filtros */}
           <aside className="lg:w-64 shrink-0">
             <div className="sticky top-32">
               <ProductFilters
@@ -329,6 +389,7 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
             </div>
           </aside>
 
+          {/* Sección de Productos */}
           <div className="flex-1">
             {isLoading ? (
               <ProductGridSkeleton />
@@ -358,7 +419,7 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
         </div>
       </main>
 
-      {/* Panel simple de conversación (sustituye VoicePanel externo) */}
+      {/* --- PANEL DE CONVERSACIÓN DE VOZ/IA --- */}
       {showVoicePanel && (
         <div className="fixed bottom-4 right-4 w-full max-w-md bg-white border rounded-xl shadow-xl p-4 space-y-3">
           <div className="flex items-center justify-between">
@@ -407,7 +468,7 @@ No hay productos cargados. Da una respuesta general breve (3–5 líneas).`;
               placeholder="Type a follow-up and press Enter…"
               className="flex-1 border rounded px-3 py-2"
             />
-            <button className="px-3 py-2 rounded bg-emerald-600 text-white">Send</button>
+            <button className="px-3 py-2 rounded bg-emerald-600 text-white" type="submit">Send</button>
           </form>
 
           <div className="text-xs text-muted-foreground">

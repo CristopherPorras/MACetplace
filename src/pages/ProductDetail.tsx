@@ -7,7 +7,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, ChevronRight } from 'lucide-react';
-
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
@@ -24,7 +23,7 @@ import {
   type Product,
 } from '@/lib/supabaseClient';
 
-import { useVoiceSession } from '@/lib/useVoiceSession';
+import { useVoiceAssistant } from '@/lib/useVoiceSession';
 import { useToast } from '@/hooks/use-toast';
 
 // (Opcional) Integra LLM si quieres respuestas del modelo:
@@ -51,18 +50,26 @@ export default function ProductDetail() {
   const { toast } = useToast();
 
   // 3) Hook de voz (si tu hook acepta callback: onAsk)
-  const voiceSession = useVoiceSession(async (userQuery: string) => {
+  // 💡 CORREGIDO: useVoiceSession -> useVoiceAssistant
+  const voiceSession = useVoiceAssistant(async (userQuery: string) => {
     const q = (userQuery || '').trim();
-    if (!q) return "I didn't catch that. Please try again.";
 
+    // 💡 Puedes usar una respuesta en el idioma configurado por el hook ('es-MX' por defecto)
+    if (!q) return "No te he entendido. ¿Podrías repetirlo, por favor?";
+    // O mantener el inglés: return "I didn't catch that. Please try again.";
+
+    // NOTA: 'product' debe estar definido en el scope donde se llama a useVoiceAssistant
     if (product) {
       const details =
         product.description?.trim() ||
-        'No description available for this item yet.';
-      return `You asked about "${product.name}". Here's what I know: ${details}`;
+        'No hay descripción disponible para este artículo aún.';
+
+      return `Has preguntado por "${product.name}". Esto es lo que sé: ${details}`;
+      // O mantener el inglés: return `You asked about "${product.name}". Here's what I know: ${details}`;
     }
 
-    return 'Sorry, I could not find information about this product.';
+    return 'Lo siento, no pude encontrar información sobre este producto.';
+    // O mantener el inglés: return 'Sorry, I could not find information about this product.';
   });
 
   // 4) Helpers tolerantes a diferencias de API del hook de voz
