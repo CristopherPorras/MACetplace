@@ -322,7 +322,7 @@ Sé breve (3–5 líneas) y útil, basándote solo en el nombre del producto.`;
         <div className="container mx-auto px-4 py-6">
           <div className="flex flex-col gap-6">
             <SectionTitle subtitle="Discover amazing products with AI-powered assistance">
-              Marketplace
+              Mackplace
             </SectionTitle>
 
             <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">

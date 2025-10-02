@@ -1,12 +1,14 @@
 // src/pages/ProductDetail.tsx
 // -------------------------------------------------------------
-// FIX: No declarar hooks después de returns condicionales.
-// Movimos useMemo (history) arriba, antes del early return.
+// FIX: Todos los hooks (incluido useMemo) van antes de cualquier return.
+// Usa useVoiceSession (español) y detiene/limpia bien el flujo de voz.
 // -------------------------------------------------------------
 
 import { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, ChevronRight } from 'lucide-react';
+import { askGemini } from '@/lib/llm';
+import { fetchRagContext } from '@/lib/rag';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
@@ -23,17 +25,90 @@ import {
   type Product,
 } from '@/lib/supabaseClient';
 
-import { useVoiceAssistant } from '@/lib/useVoiceSession';
+import { useVoiceSession } from '@/lib/useVoiceSession'; // ✅ correcto
 import { useToast } from '@/hooks/use-toast';
 
-// (Opcional) Integra LLM si quieres respuestas del modelo:
+// Si quieres IA real, descomenta e integra:
 // import { askGemini } from '@/lib/llm';
+// import { fetchRagContext } from '@/lib/rag';
+// import { buildPrompt } from '@/lib/prompt';
 
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible';
+
+
+
+
+
+function fmtPrice(v: any) {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) && n > 0 ? `$${n.toLocaleString()}` : '';
+}
+
+function topFeatures(specs?: Record<string, any> | null, max = 4): string[] {
+  if (!specs) return [];
+  const pairs = Object.entries(specs)
+    .filter(([, v]) => v != null && String(v).trim() !== '')
+    .slice(0, max);
+  return pairs.map(([k, v]) => `${k.replace(/_/g, ' ')}: ${String(v)}`);
+}
+
+function makeDeterministicPitch(p: any) {
+  const lines: string[] = [];
+  const precio = fmtPrice(p.price);
+  lines.push(`Este ${p.category?.toLowerCase() ?? 'producto'} **${p.name ?? ''}** está pensado para quienes buscan calidad y valor.`);
+
+  const feats = topFeatures(p.specs, 4);
+  if (feats.length) {
+    lines.push(`Características clave: ${feats.join(' · ')}.`);
+  }
+  if (typeof p.rating === 'number') {
+    lines.push(`Valoración: ⭐ ${p.rating}/5.`);
+  }
+  if (precio) {
+    lines.push(`Precio: ${precio}.`);
+  }
+  if (p.description) {
+    const d = String(p.description).trim();
+    if (d) lines.push(d.length > 220 ? d.slice(0, 220) + '…' : d);
+  }
+  lines.push(`Si te interesa, puedo comparar con opciones similares o verificar disponibilidad. ¿Quieres que avancemos?`);
+  return lines.join(' ');
+}
+
+function buildSalesPrompt(p: any, q: string, chunks: Array<{ text: string }>) {
+  const precio = fmtPrice(p.price);
+  const feats = topFeatures(p.specs, 6);
+  const contexto = [
+    p.description ? `Descripción: ${String(p.description).slice(0, 400)}` : '',
+    ...chunks.map(c => c.text).slice(0, 5),
+  ].filter(Boolean).join('\n');
+
+  return `
+Eres un asesor de ventas experto. Habla SIEMPRE en español (tono cercano y persuasivo, sin exagerar).
+Responde en 4–6 líneas, con 1 frase inicial atractiva, 2–3 ventajas concretas y una llamada a la acción.
+Usa SOLO la información proporcionada del producto y el contexto. Si falta un dato, no lo inventes.
+
+[Consulta del usuario]
+${q}
+
+[Producto]
+Nombre: ${p.name ?? ''}
+Categoría: ${p.category ?? ''}
+${precio ? `Precio: ${precio}` : ''}
+${typeof p.rating === 'number' ? `Valoración: ${p.rating}/5` : ''}
+
+[Características]
+${feats.length ? '- ' + feats.join('\n- ') : '(sin datos de características)'}
+
+[Contexto (opcional)]
+${contexto || '(sin contexto adicional)'}
+`;
+}
+
 
 export default function ProductDetail() {
   // 1) Parámetro /:id
@@ -49,41 +124,47 @@ export default function ProductDetail() {
 
   const { toast } = useToast();
 
-  // 3) Hook de voz (si tu hook acepta callback: onAsk)
-  // 💡 CORREGIDO: useVoiceSession -> useVoiceAssistant
-  const voiceSession = useVoiceAssistant(async (userQuery: string) => {
-    const q = (userQuery || '').trim();
+  // 3) Voz en español con sesión que expone status/start/stop/reset
+  const voice = useVoiceSession(
+    async (userQuery: string) => {
+      const q = (userQuery || '').trim();
+      if (!q) return 'No te entendí. ¿Puedes repetirlo?';
 
-    // 💡 Puedes usar una respuesta en el idioma configurado por el hook ('es-MX' por defecto)
-    if (!q) return "No te he entendido. ¿Podrías repetirlo, por favor?";
-    // O mantener el inglés: return "I didn't catch that. Please try again.";
+      if (!product) {
+        return 'Estoy cargando el producto, inténtalo en unos segundos.';
+      }
 
-    // NOTA: 'product' debe estar definido en el scope donde se llama a useVoiceAssistant
-    if (product) {
-      const details =
-        product.description?.trim() ||
-        'No hay descripción disponible para este artículo aún.';
+      // 1) RAG (si está disponible)
+      let chunks: Array<{ text: string }> = [];
+      try {
+        const rag = await fetchRagContext({ userQuery: q, productId: product.id, topK: 6 });
+        const raw = rag?.context_chunks ?? [];
+        chunks = raw
+          .filter((c: any) => Number(c.similarity ?? 0) >= 0.55)
+          .map((c: any) => ({ text: String(c.text ?? '') }));
+      } catch {
+        // sin RAG, seguimos solo con datos del producto
+      }
 
-      return `Has preguntado por "${product.name}". Esto es lo que sé: ${details}`;
-      // O mantener el inglés: return `You asked about "${product.name}". Here's what I know: ${details}`;
+      // 2) Prompt de VENTAS en español
+      const prompt = buildSalesPrompt(product, q, chunks);
+
+      // 3) LLM con fallback determinista
+      try {
+        const reply = await askGemini(prompt);
+        return reply || makeDeterministicPitch(product);
+      } catch {
+        return makeDeterministicPitch(product);
+      }
+    },
+    {
+      lang: 'es-MX',       // Reconocimiento y TTS en español
+      speakTimeoutMs: 40000,
+      // voiceName: 'Microsoft Raul - Spanish (Mexico)', // opcional
     }
+  );
 
-    return 'Lo siento, no pude encontrar información sobre este producto.';
-    // O mantener el inglés: return 'Sorry, I could not find information about this product.';
-  });
-
-  // 4) Helpers tolerantes a diferencias de API del hook de voz
-  const startVoice = () =>
-    (voiceSession as any).startListening?.() ??
-    (voiceSession as any).start?.();
-
-  const stopVoice = () =>
-    (voiceSession as any).stopListening?.() ??
-    (voiceSession as any).stop?.();
-
-  const resetVoice = () => (voiceSession as any).reset?.();
-
-  // 5) Cargar producto + similares (EFECTO)
+  // 4) Cargar producto + similares (EFECTO)
   useEffect(() => {
     let alive = true;
 
@@ -97,10 +178,7 @@ export default function ProductDetail() {
         setProduct(data);
 
         if (data) {
-          const similar = await getSimilarProductsByCategory(
-            data.category,
-            id
-          );
+          const similar = await getSimilarProductsByCategory(data.category, id);
           if (!alive) return;
           setSimilarProducts(similar);
         } else {
@@ -111,7 +189,7 @@ export default function ProductDetail() {
         toast({
           variant: 'destructive',
           title: 'Error',
-          description: 'Failed to load product details.',
+          description: 'No se pudo cargar el detalle del producto.',
         });
       } finally {
         if (alive) setIsLoading(false);
@@ -121,38 +199,30 @@ export default function ProductDetail() {
     load();
     return () => {
       alive = false;
+      // ✅ al salir de la página, cancelar voz
+      voice.stopListening?.();
     };
-  }, [id, toast]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
-  // 6) ✅ useMemo ANTES de cualquier return condicional
+  // 5) Historial para el panel (antes de cualquier return)
   const history = useMemo(() => {
     const items: { role: 'user' | 'assistant'; content: string }[] = [];
-    const userText = (voiceSession as any).lastUserText ?? (voiceSession as any).userText;
-    const answer = (voiceSession as any).lastAnswer ?? (voiceSession as any).answer;
-
-    if (userText) items.push({ role: 'user', content: userText });
-    if (answer) items.push({ role: 'assistant', content: answer });
+    if (voice.lastUserText) items.push({ role: 'user', content: voice.lastUserText });
+    if (voice.lastAnswer) items.push({ role: 'assistant', content: voice.lastAnswer });
     return items;
-  }, [
-    (voiceSession as any).lastUserText,
-    (voiceSession as any).userText,
-    (voiceSession as any).lastAnswer,
-    (voiceSession as any).answer,
-  ]);
+  }, [voice.lastUserText, voice.lastAnswer]);
 
-  // 7) Early return (después de TODOS los hooks)
+  // 6) Early return
   if (isLoading || !product) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
-        <div className="animate-pulse text-muted-foreground">Loading...</div>
+        <div className="animate-pulse text-muted-foreground">Cargando…</div>
       </div>
     );
   }
 
-  // 8) A partir de aquí TS a veces “olvida” el narrowing; fijamos 'p'
-  const p = product as Product;
-
-  // 9) Render principal
+  // 7) Render principal
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
@@ -161,7 +231,7 @@ export default function ProductDetail() {
           <Link to="/">
             <Button variant="ghost" size="sm">
               <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to Marketplace
+              Volver al marketplace
             </Button>
           </Link>
         </div>
@@ -173,8 +243,8 @@ export default function ProductDetail() {
           {/* Product Image */}
           <div className="aspect-square rounded-2xl overflow-hidden shadow-card">
             <img
-              src={p.image_url || undefined}
-              alt={p.name || 'Product'}
+              src={product.image_url || undefined}
+              alt={product.name || 'Producto'}
               className="w-full h-full object-cover"
               loading="lazy"
             />
@@ -184,27 +254,27 @@ export default function ProductDetail() {
           <div className="flex flex-col gap-6">
             <div className="space-y-4">
               <div className="flex items-start justify-between gap-4">
-                <h1 className="text-4xl font-bold tracking-tight">{p.name}</h1>
-                {typeof p.rating === 'number' && p.rating > 0 && (
-                  <RatingBadge value={p.rating} />
+                <h1 className="text-4xl font-bold tracking-tight">{product.name}</h1>
+                {typeof product.rating === 'number' && product.rating > 0 && (
+                  <RatingBadge value={product.rating} />
                 )}
               </div>
 
-              <PriceTag amount={p.price} className="text-3xl" />
+              <PriceTag amount={product.price} className="text-3xl" />
 
               <div className="flex flex-wrap gap-2">
                 <span className="px-3 py-1 bg-secondary rounded-full text-sm font-medium">
-                  {p.category}
+                  {product.category}
                 </span>
               </div>
             </div>
 
             {/* Key Specs */}
-            {p.specs && Object.keys(p.specs).length > 0 && (
+            {product.specs && Object.keys(product.specs).length > 0 && (
               <Card className="p-6">
-                <h3 className="font-semibold mb-4">Key Features</h3>
+                <h3 className="font-semibold mb-4">Características</h3>
                 <ul className="space-y-2">
-                  {Object.entries(p.specs).map(([key, value]) => (
+                  {Object.entries(product.specs).map(([key, value]) => (
                     <li key={key} className="flex items-start gap-2">
                       <ChevronRight className="h-5 w-5 text-primary shrink-0 mt-0.5" />
                       <span className="text-sm">
@@ -230,16 +300,15 @@ export default function ProductDetail() {
                     variant="ghost"
                     className="w-full justify-between p-0 hover:bg-transparent"
                   >
-                    <h3 className="font-semibold">Full Description</h3>
+                    <h3 className="font-semibold">Descripción completa</h3>
                     <ChevronRight
-                      className={`h-5 w-5 transition-transform ${isDescriptionOpen ? 'rotate-90' : ''
-                        }`}
+                      className={`h-5 w-5 transition-transform ${isDescriptionOpen ? 'rotate-90' : ''}`}
                     />
                   </Button>
                 </CollapsibleTrigger>
                 <CollapsibleContent className="mt-4">
                   <p className="text-muted-foreground leading-relaxed">
-                    {p.description || 'No description available.'}
+                    {product.description || 'Sin descripción disponible.'}
                   </p>
                 </CollapsibleContent>
               </Card>
@@ -248,12 +317,12 @@ export default function ProductDetail() {
             {/* Voice AI CTA */}
             <div className="pt-4">
               <VoiceButton
-                onStart={() => { setShowVoicePanel(true); startVoice(); }}
-                onStop={() => { stopVoice(); }}
-                status={(voiceSession as any).status}
+                onStart={() => { setShowVoicePanel(true); voice.startListening(); }}
+                onStop={() => { voice.stopListening(); }}
+                status={voice.status} // 'idle' | 'listening' | 'thinking' | 'speaking'
               />
               <p className="text-sm text-muted-foreground mt-2">
-                Ask questions about this product using voice
+                Haz preguntas sobre este producto con tu voz
               </p>
             </div>
           </div>
@@ -262,7 +331,7 @@ export default function ProductDetail() {
         {/* Similar Products */}
         {similarProducts.length > 0 && (
           <section className="space-y-6">
-            <SectionTitle>Similar Products</SectionTitle>
+            <SectionTitle>Productos similares</SectionTitle>
             <ScrollArea className="w-full">
               <div className="flex gap-6 pb-4">
                 {similarProducts.map((similar) => (
@@ -281,9 +350,13 @@ export default function ProductDetail() {
       {showVoicePanel && (
         <VoicePanel
           history={history}
-          status={(voiceSession as any).status}
-          onClose={() => { setShowVoicePanel(false); resetVoice(); }}
-          onRetry={() => startVoice()}
+          status={voice.status}
+          onClose={() => {
+            setShowVoicePanel(false);
+            voice.stopListening();
+            voice.reset();
+          }}
+          onRetry={() => voice.startListening()}
         />
       )}
     </div>
