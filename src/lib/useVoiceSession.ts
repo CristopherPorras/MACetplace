@@ -1,112 +1,108 @@
-import { useState, useCallback } from 'react';
-import { fetchRagContext } from './rag';
-import { buildPrompt } from './prompt';
-import { Product } from './supabaseClient';
+// src/lib/useVoiceSession.ts
+import { useCallback, useState } from "react";
+import { useVoiceAssistant } from "@/hooks/useVoiceAssistant";
 
-export type VoiceStatus = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
+export type VoiceStatus = "idle" | "listening" | "thinking" | "speaking";
 
-export type Message = {
-  role: 'user' | 'assistant';
-  content: string;
-};
+/** Tu callback de IA: recibe el texto del usuario y debe devolver la respuesta */
+type OnAsk = (text: string) => Promise<string>;
 
-type UseVoiceSessionProps = {
-  product: Product;
-  onError?: (error: Error) => void;
-};
+/** Mensajes para historial simple (útil en VoicePanel) */
+export type VoiceMsg = { role: "user" | "assistant"; content: string };
 
-export function useVoiceSession({ product, onError }: UseVoiceSessionProps) {
-  const [status, setStatus] = useState<VoiceStatus>('idle');
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
+export function useVoiceSession(onAsk?: OnAsk) {
+    // Estado público de la sesión
+    const [status, setStatus] = useState<VoiceStatus>("idle");
+    const [lastUserText, setLastUserText] = useState<string>("");
+    const [lastAnswer, setLastAnswer] = useState<string>("");
+    const [messages, setMessages] = useState<VoiceMsg[]>([]);
 
-  const processUserQuery = useCallback(
-    async (userQuery: string) => {
-      if (isProcessing) return;
+    // Hook base de voz (STT/TTS)
+    const assistant = useVoiceAssistant();
 
-      setIsProcessing(true);
-      setStatus('thinking');
+    /** Inicia la escucha y resuelve el turno completo: escuchar → pensar → responder → (hablar) */
+    const startListening = useCallback(() => {
+        setStatus("listening");
 
-      // Add user message to history
-      setMessages((prev) => [...prev, { role: 'user', content: userQuery }]);
+        // Le pasamos un handler a la instancia cuando llegue la transcripción
+        assistant.startListening?.(async (raw: string) => {
+            const userText = (raw ?? "").trim();
+            if (!userText) {
+                setStatus("idle");
+                return;
+            }
 
-      try {
-        // Fetch RAG context
-        const ragContext = await fetchRagContext({
-          productId: product.id,
-          userQuery,
+            setLastUserText(userText);
+            setMessages((m) => [...m, { role: "user", content: userText }]);
+            setStatus("thinking");
+
+            let reply = "";
+            if (onAsk) {
+                try {
+                    const out = await onAsk(userText);
+                    reply = (out ?? "").trim();
+                } catch (err) {
+                    console.error("[useVoiceSession] onAsk error:", err);
+                    reply = ""; // dejar que caiga en fallback visual (no hablar)
+                }
+            }
+
+            if (reply) {
+                setLastAnswer(reply);
+                setMessages((m) => [...m, { role: "assistant", content: reply }]);
+
+                // Intentar hablar la respuesta
+                try {
+                    setStatus("speaking");
+                    assistant.speak?.(reply);
+                } catch {
+                    setStatus("idle");
+                }
+            } else {
+                // Sin respuesta del modelo
+                setLastAnswer("");
+                setStatus("idle");
+            }
         });
+    }, [assistant, onAsk]);
 
-        // Build prompt
-        const prompt = buildPrompt({
-          product,
-          chunks: ragContext.context_chunks,
-          userQuery,
-        });
-
-        // Simulate AI response (in production, this would call Gemini Live)
-        setStatus('speaking');
-        
-        // Mock response for demo
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        
-        const mockResponse = `Based on the ${product.name}, ${
-          ragContext.context_chunks[0]?.content || 
-          'this product offers excellent quality and value.'
-        } ${userQuery.toLowerCase().includes('price') 
-          ? `It's currently priced at $${product.price}.`
-          : ''
-        }`;
-
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: mockResponse },
-        ]);
-
-        setStatus('idle');
-      } catch (error) {
-        console.error('Error processing voice query:', error);
-        setStatus('error');
-        if (onError) {
-          onError(error as Error);
+    /** Detiene la escucha si está soportado y resetea status a idle */
+    const stopListening = useCallback(() => {
+        try {
+            assistant.stopListening?.();
+        } finally {
+            setStatus("idle");
         }
-        
-        // Reset to idle after showing error
-        setTimeout(() => setStatus('idle'), 2000);
-      } finally {
-        setIsProcessing(false);
-      }
-    },
-    [product, isProcessing, onError]
-  );
+    }, [assistant]);
 
-  const startListening = useCallback(() => {
-    setStatus('listening');
-    
-    // Simulate voice recognition (in production, use Web Speech API or Gemini Live)
-    setTimeout(() => {
-      const mockQuery = "Can you tell me more about this product's features?";
-      processUserQuery(mockQuery);
-    }, 2000);
-  }, [processUserQuery]);
+    /** Limpia historial y estados de último turno */
+    const reset = useCallback(() => {
+        setLastUserText("");
+        setLastAnswer("");
+        setMessages([]);
+        setStatus("idle");
+    }, []);
 
-  const stopListening = useCallback(() => {
-    setStatus('idle');
-  }, []);
+    return {
+        // Estado principal
+        status,
+        lastUserText,
+        lastAnswer,
+        messages,
 
-  const reset = useCallback(() => {
-    setStatus('idle');
-    setMessages([]);
-    setIsProcessing(false);
-  }, []);
+        // Métodos
+        startListening,
+        stopListening,
+        reset,
 
-  return {
-    status,
-    messages,
-    isProcessing,
-    startListening,
-    stopListening,
-    processUserQuery,
-    reset,
-  };
+        // Aliases para compatibilidad con tu UI
+        start: startListening,
+        stop: stopListening,
+        userText: lastUserText,
+        answer: lastAnswer,
+
+        // Extras útiles
+        transcript: (assistant as any)?.transcript as string | undefined,
+        speak: assistant.speak?.bind(assistant),
+    };
 }
